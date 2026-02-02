@@ -39,16 +39,19 @@ from scipy.integrate import solve_ivp
 # Section 1: Lookup Tables
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 21-point OCV table (hybrid: GreenHub SOC 0-15%, NASA B0005 SOC 20-100%)
-# Source: NASA PCoE Battery Dataset B0005, IR-corrected; GreenHub 341K samples
+# 21-point OCV table from iPhone sysdiagnose near-rest measurements.
+# Source: PLBatteryAgent_EventBackward_Battery rows with |InstantAmperage| < 50 mA
+# (IR drop < 5mV at typical resistance), supplemented by EPSQL BDC_SBC near-rest
+# for SOC points with sparse high-res data. SOC 0% extrapolated to 3.30V
+# (min observed voltage under load was 3.20V).
 OCV_SOC = np.array([
     0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
     0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00,
 ])
 OCV_VOLTAGE = np.array([
-    3.300, 3.540, 3.585, 3.618, 3.639, 3.661, 3.687, 3.708, 3.726, 3.745,
-    3.767, 3.793, 3.821, 3.851, 3.884, 3.919, 3.957, 3.998, 4.044, 4.101,
-    4.191,
+    3.300, 3.653, 3.670, 3.700, 3.731, 3.750, 3.770, 3.789, 3.808, 3.833,
+    3.858, 3.895, 3.931, 3.980, 4.030, 4.092, 4.154, 4.198, 4.243, 4.310,
+    4.376,
 ])
 
 # 15-point SOC-dependent resistance table (Ohms)
@@ -168,10 +171,10 @@ DEFAULT = BatteryParams()
 def ocv(z: float) -> float:
     """Open-circuit voltage from 21-point lookup table with linear interp.
 
-    Clamped to [3.0, 4.35] V.
+    Clamped to [3.0, 4.45] V (iPhone NMC/LCO cell range).
     """
     z_c = np.clip(z, 0.0, 1.0)
-    return float(np.clip(np.interp(z_c, OCV_SOC, OCV_VOLTAGE), 3.0, 4.35))
+    return float(np.clip(np.interp(z_c, OCV_SOC, OCV_VOLTAGE), 3.0, 4.45))
 
 
 def resistance_at_soc(z: float) -> float:

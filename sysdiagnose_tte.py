@@ -34,7 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Add script directory for battery_model import
+# Add script directory for battery_model import (flat repo layout)
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 import battery_model as bm
@@ -252,6 +252,60 @@ def query_app_energy(conn: sqlite3.Connection) -> Optional[pd.DataFrame]:
     """
     df = pd.read_sql_query(query, conn)
     return df if len(df) > 0 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query EPSQL (BatteryDataCollection) -- 38 days, 5-min resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_epsql(db_dir: Path) -> Optional[Path]:
+    """Find the EPSQL database in the powerlogs directory."""
+    powerlogs = db_dir.parent / "powerlogs" if db_dir.name.endswith(".PLSQL") else db_dir
+    if not powerlogs.is_dir():
+        powerlogs = db_dir.parent
+    for f in sorted(powerlogs.glob("*.EPSQL")):
+        return f
+    return None
+
+
+def query_epsql_battery(epsql_path: Path) -> Optional[pd.DataFrame]:
+    """Query the BDC SBC table from EPSQL (5-min interval data, ~38 days).
+
+    Returns DataFrame with same column conventions as PLSQL battery table:
+    Level (0-100), Voltage (mV), InstantAmperage (mA), Temperature (C),
+    IsCharging (0/1), timestamp (datetime).
+    """
+    conn = sqlite3.connect(str(epsql_path))
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+
+    sbc_table = None
+    for t in tables:
+        if "BDC_SBC" in t:
+            sbc_table = t
+            break
+    if sbc_table is None:
+        conn.close()
+        return None
+
+    df = pd.read_sql_query(
+        f"SELECT timestamp, StateOfCharge, Voltage, InstantAmperage, "
+        f"Temperature, IsCharging, AccumulatedSystemLoad "
+        f"FROM [{sbc_table}] ORDER BY timestamp",
+        conn)
+    conn.close()
+
+    if len(df) == 0:
+        return None
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+    df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # Rename to match PLSQL conventions
+    df = df.rename(columns={"StateOfCharge": "Level"})
+
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -747,6 +801,386 @@ def plot_tornado(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multi-session validation (EPSQL -- 38 days, 5-min resolution)
+#
+# Two independent validation modes, each testing different model components:
+#
+#   1. CURRENT-DRIVEN (Coulomb counting test)
+#      Input:  measured InstantAmperage from EPSQL
+#      Tests:  Q_eff parameter, coulombic efficiency (eta), OCV curve
+#      Output: SOC RMSE vs iOS-reported Level
+#      Question answered: "Given the exact current draw, does the model
+#      track SOC correctly?"
+#
+#   2. FORWARD SIMULATION (full-model TTE test)
+#      Input:  power-calibrated usage schedule (V*I -> cpu_load)
+#      Tests:  component power model, current solver, SOC dynamics, OCV
+#      Output: TTE error (model vs observed drain rate extrapolation)
+#      Question answered: "Given the phone's power consumption profile,
+#      does the model predict battery life correctly?"
+#
+# The power-calibrated schedule uses measured V*I (battery discharge power)
+# to set cpu_load so the model's total_power() matches reality. Screen state
+# is inferred from current magnitude (|I| > 80mA = screen likely on).
+# This is imperfect but much better than assuming screen always on.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_power_calibrated_schedule(
+        session: pd.DataFrame,
+        params: bm.BatteryParams,
+) -> bm.Callable[[float], Dict]:
+    """Build usage schedule calibrated to match measured battery power.
+
+    For each 5-min EPSQL interval:
+      1. Compute measured power: P_meas = V * |I|  (from Voltage, InstantAmperage)
+      2. Infer screen state: |I| > 80mA => screen on (heuristic)
+      3. Set cpu_load so total_power(usage) ~= P_meas
+
+    This preserves the model's power->current->SOC pipeline while ensuring
+    the simulated power consumption matches what was actually measured.
+
+    For sessions where display_df is available (PLSQL overlap window),
+    use build_usage_schedule() instead -- it has real brightness data.
+    """
+    t0 = session["timestamp"].iloc[0]
+    t_seconds = (session["timestamp"] - t0).dt.total_seconds().values
+
+    voltage_v = pd.to_numeric(
+        session["Voltage"], errors="coerce").fillna(3800).values / 1000.0
+    current_ma = pd.to_numeric(
+        session["InstantAmperage"], errors="coerce").fillna(0).values
+    abs_current = np.abs(current_ma)
+
+    # Measured battery discharge power (mW)
+    measured_mw = voltage_v * abs_current
+
+    # Heuristic screen state: >80mA suggests screen on, <30mA deep sleep
+    screen_on = abs_current > 80.0
+
+    # Calibrate cpu_load per interval so total_power ~= measured_mw
+    n = len(session)
+    cpu_loads = np.zeros(n)
+    brightness = np.where(screen_on, 0.5, 0.0)
+
+    for k in range(n):
+        son = bool(screen_on[k])
+        # Base power from all non-CPU-load components
+        p_base = 0.0
+        if son:
+            p_base += params.screen_base_mw + params.screen_brightness_coeff_mw * 0.5
+        p_base += params.cpu_background_mw
+        p_base += params.wifi_idle_mw
+        p_base += params.cellular_idle_mw
+        p_base += params.bt_idle_mw
+
+        if measured_mw[k] < params.cpu_idle_mw + 10:
+            # Deep sleep: below idle threshold
+            cpu_loads[k] = 0.0
+        else:
+            load = (measured_mw[k] - p_base) / params.cpu_load_coeff_mw
+            cpu_loads[k] = float(np.clip(load, 0.0, 1.0))
+
+    def schedule(t: float) -> Dict:
+        idx = np.searchsorted(t_seconds, t, side="right") - 1
+        idx = max(0, min(idx, n - 1))
+        son = bool(screen_on[idx])
+        return {
+            "screen_on": son,
+            "brightness": float(brightness[idx]),
+            "cpu_load": float(cpu_loads[idx]),
+            "wifi_state": "idle",
+            "wifi_data_rate": 0.0,
+            "cellular_state": "idle",
+            "cellular_signal": 0.8,
+            "cellular_data_rate": 0.0,
+            "gps_state": "off",
+            "bluetooth_state": "idle",
+            "audio_state": "off",
+            "camera_state": "off",
+        }
+
+    return schedule
+
+
+def _session_temperature(session: pd.DataFrame) -> float:
+    """Extract initial temperature from session, with sanity checks."""
+    if "Temperature" not in session.columns:
+        return 25.0
+    temps = pd.to_numeric(session["Temperature"], errors="coerce").dropna()
+    if len(temps) == 0:
+        return 25.0
+    T = float(temps.iloc[0])
+    # EPSQL stores temperature * 100 in some firmware versions
+    if T > 80:
+        T /= 100.0
+    return np.clip(T, -10.0, 50.0)
+
+
+def validate_multi_session(
+        epsql_df: pd.DataFrame,
+        params: bm.BatteryParams,
+        min_soc_drop: float = 10.0,
+        display_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Validate model against all EPSQL discharge sessions.
+
+    Runs two independent tests per session:
+
+    1. Current-driven (tests Q_eff and OCV curve):
+       Feeds measured InstantAmperage into model, compares model SOC to
+       iOS Level. Low RMSE means capacity and efficiency params are correct.
+
+    2. Forward simulation (tests full TTE pipeline):
+       Uses power-calibrated schedule (V*I -> cpu_load), runs model from
+       observed start SOC, compares drain rate. Low TTE error means the
+       power->current->SOC pipeline works end-to-end.
+
+    If display_df is provided, sessions overlapping PLSQL time window use
+    real brightness data instead of the current-magnitude heuristic.
+
+    Returns DataFrame with columns:
+        session_idx, start_soc, end_soc, duration_h, T_init,
+        cd_rmse_pct     - Current-driven SOC RMSE (% points)
+        cd_final_err    - Current-driven final SOC error (% points)
+        fwd_rmse_pct    - Forward sim SOC RMSE (% points)
+        obs_tte_h       - Observed TTE (extrapolated from drain rate)
+        model_tte_h     - Forward sim TTE (extrapolated from drain rate)
+        used_display    - Whether PLSQL display data was available
+    """
+    sessions = extract_discharge_sessions(epsql_df, min_soc_drop)
+    if not sessions:
+        return pd.DataFrame()
+
+    # PLSQL display time window (for overlap detection)
+    plsql_t0 = None
+    plsql_t1 = None
+    if display_df is not None and len(display_df) > 0:
+        plsql_t0 = display_df["timestamp"].iloc[0]
+        plsql_t1 = display_df["timestamp"].iloc[-1]
+
+    records: List[Dict] = []
+    for idx, session in enumerate(sessions):
+        t0 = session["timestamp"].iloc[0]
+        duration_s = (session["timestamp"].iloc[-1] - t0).total_seconds()
+        duration_h = duration_s / 3600.0
+        soc_start = float(session["Level"].iloc[0]) / 100.0
+        soc_end = float(session["Level"].iloc[-1]) / 100.0
+        soc_drop = soc_start - soc_end
+
+        if soc_drop <= 0 or duration_s < 600:
+            continue
+
+        T_init = _session_temperature(session)
+        obs_t = (session["timestamp"] - t0).dt.total_seconds().values
+        obs_soc = session["Level"].values.astype(float) / 100.0
+
+        # --- Test 1: Current-driven (Coulomb counting) ---
+        # Uses measured current directly. Tests Q_eff and eta only.
+        raw_ma = pd.to_numeric(
+            session["InstantAmperage"], errors="coerce").fillna(0).values
+        current_a = -raw_ma / 1000.0  # iOS negative=discharge -> positive
+
+        def _current_fn(t, _t_s=obs_t, _i=current_a):
+            k = np.searchsorted(_t_s, t, side="right") - 1
+            k = max(0, min(k, len(_i) - 1))
+            return float(_i[k])
+
+        try:
+            cd_result = bm.simulate_current_driven(
+                _current_fn, params,
+                soc_init=soc_start,
+                T_ambient=T_init, T_cell_init=T_init,
+                t_max=duration_s, dt=300.0,
+            )
+            cd_soc_interp = np.interp(obs_t, cd_result["t"], cd_result["soc"])
+            cd_rmse = float(np.sqrt(np.mean(
+                (cd_soc_interp - obs_soc) ** 2)) * 100)
+            cd_final_err = float(
+                (cd_result["soc"][-1] - soc_end) * 100)
+        except Exception as e:
+            print(f"    Session {idx}: current-driven failed: {e}")
+            cd_rmse = float("nan")
+            cd_final_err = float("nan")
+
+        # --- Test 2: Forward simulation (full model pipeline) ---
+        # Check if this session overlaps PLSQL display data
+        used_display = False
+        if (plsql_t0 is not None and
+                t0 >= plsql_t0 and
+                session["timestamp"].iloc[-1] <= plsql_t1):
+            usage_fn = build_usage_schedule(session, display_df)
+            used_display = True
+        else:
+            usage_fn = build_power_calibrated_schedule(session, params)
+
+        try:
+            fwd_result = bm.simulate(
+                usage_fn, params,
+                soc_init=soc_start,
+                T_ambient=T_init, T_cell_init=T_init,
+                t_max=duration_s, dt=300.0,
+            )
+            fwd_soc_interp = np.interp(
+                obs_t, fwd_result["t"], fwd_result["soc"])
+            fwd_rmse = float(np.sqrt(np.mean(
+                (fwd_soc_interp - obs_soc) ** 2)) * 100)
+
+            # Extrapolate TTE from drain rates (100% -> 1%)
+            obs_drain_rate = soc_drop / duration_h
+            obs_tte_h = 0.99 / obs_drain_rate
+
+            model_soc_drop = soc_start - float(fwd_result["soc"][-1])
+            if model_soc_drop > 0.001:
+                model_tte_h = 0.99 / (model_soc_drop / duration_h)
+            else:
+                model_tte_h = float("inf")
+        except Exception as e:
+            print(f"    Session {idx}: forward sim failed: {e}")
+            fwd_rmse = float("nan")
+            obs_tte_h = float("nan")
+            model_tte_h = float("nan")
+
+        records.append({
+            "session_idx": idx,
+            "start_soc": soc_start * 100,
+            "end_soc": soc_end * 100,
+            "soc_drop": soc_drop * 100,
+            "duration_h": duration_h,
+            "T_init": T_init,
+            "cd_rmse_pct": cd_rmse,
+            "cd_final_err": cd_final_err,
+            "fwd_rmse_pct": fwd_rmse,
+            "obs_tte_h": obs_tte_h,
+            "model_tte_h": model_tte_h,
+            "used_display": used_display,
+        })
+
+    return pd.DataFrame(records)
+
+
+def plot_multi_session_scatter(
+        results_df: pd.DataFrame,
+        fig_path: Path
+) -> None:
+    """Figure 7: Model TTE vs Observed TTE scatter across sessions."""
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    obs = results_df["obs_tte_h"].values
+    model = results_df["model_tte_h"].values
+
+    # Filter unreasonable values
+    mask = np.isfinite(obs) & np.isfinite(model) & (obs < 50) & (model < 50)
+    obs, model = obs[mask], model[mask]
+
+    ax.scatter(obs, model, c="steelblue", alpha=0.7, s=40,
+               edgecolors="white", linewidth=0.5)
+
+    # Identity line and +/-20% band
+    lim = max(obs.max(), model.max()) * 1.1 if len(obs) > 0 else 30
+    ax.plot([0, lim], [0, lim], "k--", alpha=0.5, label="Perfect prediction")
+    x_line = np.linspace(0, lim, 100)
+    ax.fill_between(x_line, x_line * 0.8, x_line * 1.2,
+                    alpha=0.1, color="gray", label="+/- 20%")
+
+    # Statistics annotation
+    if len(obs) > 1:
+        errors = model - obs
+        mae = np.mean(np.abs(errors))
+        mape = np.mean(np.abs(errors / obs)) * 100
+        ss_res = np.sum(errors ** 2)
+        ss_tot = np.sum((obs - obs.mean()) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        ax.text(0.05, 0.95,
+                f"N = {len(obs)} sessions\n"
+                f"MAE = {mae:.1f} h\n"
+                f"MAPE = {mape:.0f}%\n"
+                f"R^2 = {r2:.3f}",
+                transform=ax.transAxes, va="top", fontsize=10,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    ax.set_xlabel("Observed TTE (hours)")
+    ax.set_ylabel("Model TTE (hours)")
+    ax.set_title("Model vs Observed TTE (Multi-Session)")
+    ax.legend(loc="lower right")
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+def plot_multi_session_errors(
+        results_df: pd.DataFrame,
+        fig_path: Path
+) -> None:
+    """Figure 8: Current-driven SOC RMSE, forward SOC RMSE, and TTE errors.
+
+    Three panels showing what each validation mode reveals:
+      Left:   Current-driven SOC RMSE -> tests Q_eff and OCV accuracy
+      Center: Forward sim SOC RMSE    -> tests full power pipeline
+      Right:  TTE prediction error    -> practical prediction accuracy
+    """
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Left: Current-driven SOC RMSE (tests capacity + OCV)
+    cd_rmse = results_df["cd_rmse_pct"].dropna().values
+    if len(cd_rmse) > 0:
+        ax1.hist(cd_rmse, bins=15, color="steelblue", alpha=0.8,
+                 edgecolor="white")
+        ax1.axvline(np.median(cd_rmse), color="red", linestyle="--",
+                    label=f"Median: {np.median(cd_rmse):.1f}%")
+        ax1.legend()
+    ax1.set_xlabel("SOC RMSE (% points)")
+    ax1.set_ylabel("Count")
+    ax1.set_title("Current-Driven\n(tests Q_eff, OCV)")
+    ax1.grid(True, alpha=0.3)
+
+    # Center: Forward sim SOC RMSE (tests full pipeline)
+    fwd_rmse = results_df["fwd_rmse_pct"].dropna().values
+    if len(fwd_rmse) > 0:
+        ax2.hist(fwd_rmse, bins=15, color="teal", alpha=0.8,
+                 edgecolor="white")
+        ax2.axvline(np.median(fwd_rmse), color="red", linestyle="--",
+                    label=f"Median: {np.median(fwd_rmse):.1f}%")
+        ax2.legend()
+    ax2.set_xlabel("SOC RMSE (% points)")
+    ax2.set_ylabel("Count")
+    ax2.set_title("Forward Sim\n(tests power pipeline)")
+    ax2.grid(True, alpha=0.3)
+
+    # Right: TTE error histogram
+    mask = (np.isfinite(results_df["obs_tte_h"]) &
+            np.isfinite(results_df["model_tte_h"]))
+    tte_err = (results_df.loc[mask, "model_tte_h"] -
+               results_df.loc[mask, "obs_tte_h"]).values
+    tte_err = tte_err[np.abs(tte_err) < 20]
+
+    if len(tte_err) > 0:
+        ax3.hist(tte_err, bins=15, color="coral", alpha=0.8,
+                 edgecolor="white")
+        ax3.axvline(0, color="black", linestyle="-", linewidth=1)
+        ax3.axvline(np.median(tte_err), color="red", linestyle="--",
+                    label=f"Median: {np.median(tte_err):+.1f} h")
+        ax3.legend()
+    ax3.set_xlabel("TTE Error (model - obs, hours)")
+    ax3.set_ylabel("Count")
+    ax3.set_title("TTE Prediction Error\n(practical accuracy)")
+    ax3.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Multi-Session Validation (N={len(results_df)} sessions)",
+                 fontsize=13, y=1.02)
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -892,6 +1326,92 @@ def run_pipeline(db_path: Path, figures_dir: Path,
         print(f"  {name:30s}  [{lo:.1f}, {hi:.1f}]  "
               f"swing={abs(hi-lo):.1f} h")
     plot_tornado(tornado, figures_dir / "sysdiag_tornado.png")
+
+    # --- EPSQL multi-session validation (Figures 7-8) ---
+    #
+    # Two independent tests per session:
+    #   Current-driven: measured I(t) -> model SOC vs iOS Level
+    #     Tests Q_eff (capacity) and OCV curve accuracy
+    #   Forward sim: power-calibrated schedule -> model SOC vs iOS Level
+    #     Tests full pipeline: component power -> current -> SOC -> TTE
+    #
+    # Sessions overlapping PLSQL window use real display brightness.
+    # Other sessions use V*I power calibration with screen heuristic.
+    print("\n--- EPSQL Multi-Session Validation ---")
+    epsql_path = find_epsql(db_path)
+    if epsql_path is not None:
+        print(f"  Found EPSQL: {epsql_path.name}")
+        epsql_df = query_epsql_battery(epsql_path)
+        if epsql_df is not None:
+            print(f"  {len(epsql_df)} EPSQL rows, 5-min resolution")
+            print(f"  Time range: {epsql_df['timestamp'].iloc[0]} to "
+                  f"{epsql_df['timestamp'].iloc[-1]}")
+
+            epsql_sessions = extract_discharge_sessions(
+                epsql_df, min_soc_drop=10.0)
+            print(f"  Found {len(epsql_sessions)} discharge sessions "
+                  f"(>10% drop)")
+
+            if epsql_sessions:
+                print("  Running dual-mode validation...")
+                ms_results = validate_multi_session(
+                    epsql_df, params, min_soc_drop=10.0,
+                    display_df=display_df)
+
+                if len(ms_results) > 0:
+                    n_disp = ms_results["used_display"].sum()
+                    n_pcal = len(ms_results) - n_disp
+                    print(f"  Validated {len(ms_results)} sessions "
+                          f"({n_disp} with display data, "
+                          f"{n_pcal} power-calibrated)")
+
+                    # Current-driven results (capacity/OCV test)
+                    cd = ms_results["cd_rmse_pct"].dropna()
+                    if len(cd) > 0:
+                        print(f"\n  Current-driven (tests Q_eff + OCV):")
+                        print(f"    SOC RMSE: median {cd.median():.1f}%, "
+                              f"mean {cd.mean():.1f}%")
+                        cd_err = ms_results["cd_final_err"].dropna()
+                        print(f"    Final SOC error: median "
+                              f"{cd_err.median():+.1f}%, "
+                              f"mean {cd_err.mean():+.1f}%")
+
+                    # Forward sim results (full pipeline test)
+                    fwd = ms_results["fwd_rmse_pct"].dropna()
+                    if len(fwd) > 0:
+                        print(f"\n  Forward sim (tests full pipeline):")
+                        print(f"    SOC RMSE: median {fwd.median():.1f}%, "
+                              f"mean {fwd.mean():.1f}%")
+
+                    valid_tte = ms_results[
+                        np.isfinite(ms_results["obs_tte_h"]) &
+                        np.isfinite(ms_results["model_tte_h"])
+                    ]
+                    if len(valid_tte) > 0:
+                        tte_err = (valid_tte["model_tte_h"] -
+                                   valid_tte["obs_tte_h"])
+                        print(f"\n  TTE prediction:")
+                        print(f"    MAE: {np.abs(tte_err).mean():.1f} h")
+                        mape = np.mean(
+                            np.abs(tte_err / valid_tte["obs_tte_h"])) * 100
+                        print(f"    MAPE: {mape:.0f}%")
+                        print(f"    Median bias: "
+                              f"{tte_err.median():+.1f} h")
+
+                    plot_multi_session_scatter(
+                        ms_results,
+                        figures_dir / "sysdiag_multi_session_tte.png")
+                    plot_multi_session_errors(
+                        ms_results,
+                        figures_dir / "sysdiag_multi_session_errors.png")
+                else:
+                    print("  No sessions validated successfully")
+            else:
+                print("  No discharge sessions found in EPSQL")
+        else:
+            print("  Could not read EPSQL battery data")
+    else:
+        print("  No EPSQL database found (skipping multi-session)")
 
     conn.close()
     print("\nPipeline complete.")
