@@ -25,6 +25,7 @@ import argparse
 import sqlite3
 import sys
 from pathlib import Path
+from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -840,6 +841,313 @@ def plot_tornado(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sensitivity sweeps (Figures 9-12)
+#
+# Four analyses that exercise different model dimensions:
+#   Temperature sweep  -- cold degrades capacity (Eq 5) and increases R0 (Eq 3)
+#   Battery health     -- aging reduces Q_eff, shortening TTE proportionally
+#   Usage scenarios    -- component power model differentiates activities
+#   Screen-on fraction -- dominant lifestyle factor for daily battery life
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_temperature_sweep(
+        session: pd.DataFrame,
+        display_df: Optional[pd.DataFrame],
+        params: bm.BatteryParams,
+        cycle_count: int = 716,
+        temperatures: Optional[List[float]] = None,
+) -> List[Tuple[float, float]]:
+    """TTE at several ambient temperatures using calibrated PLSQL schedule.
+
+    At T < T_ref (25C):
+      - Q_eff drops via Eq 5: fewer coulombs available
+      - R0 increases via Eq 3: more voltage sag, higher current for same power
+      - Both effects compound to reduce TTE significantly in cold weather
+
+    Returns list of (temperature_C, tte_hours) tuples.
+    """
+    if temperatures is None:
+        temperatures = [-10.0, 0.0, 10.0, 25.0, 35.0]
+
+    usage_fn = build_usage_schedule(session, display_df, params)
+
+    results = []
+    for T in temperatures:
+        print(f"    Simulating T={T:+.0f}C...")
+        result = bm.simulate(
+            usage_fn, params,
+            T_ambient=T, T_cell_init=T,
+            cycle_count=cycle_count, dt=60.0,
+        )
+        results.append((T, bm.time_to_empty_hours(result)))
+
+    return results
+
+
+def plot_temperature_sweep(
+        sweep: List[Tuple[float, float]],
+        fig_path: Path,
+) -> None:
+    """Figure 9: TTE vs ambient temperature bar chart."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    temps = [s[0] for s in sweep]
+    ttes = [s[1] for s in sweep]
+
+    # Color gradient: blue for cold, red for hot
+    norm = plt.Normalize(min(temps), max(temps))
+    cmap = plt.cm.RdYlBu_r
+    colors = [cmap(norm(t)) for t in temps]
+
+    bars = ax.bar([f"{t:+.0f}" for t in temps], ttes, color=colors,
+                  edgecolor="white", width=0.6)
+
+    # Annotate bars with TTE and % change from 25C reference
+    ref_idx = None
+    for i, t in enumerate(temps):
+        if t == 25.0:
+            ref_idx = i
+            break
+    ref_tte = ttes[ref_idx] if ref_idx is not None else ttes[-1]
+
+    for bar, tte, T in zip(bars, ttes, temps):
+        pct = (tte - ref_tte) / ref_tte * 100
+        label = f"{tte:.1f}h"
+        if abs(pct) > 0.5:
+            label += f"\n({pct:+.0f}%)"
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                label, ha="center", va="bottom", fontsize=9)
+
+    ax.set_xlabel("Ambient Temperature (C)")
+    ax.set_ylabel("Time to Empty (hours)")
+    ax.set_title("Battery Life vs Ambient Temperature")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+def run_soh_sweep(
+        session: pd.DataFrame,
+        display_df: Optional[pd.DataFrame],
+        params: bm.BatteryParams,
+        cycle_count: int = 716,
+        health_fractions: Optional[List[float]] = None,
+) -> List[Tuple[float, float]]:
+    """TTE at several battery state-of-health levels.
+
+    Varies Q_design_mah (effective capacity) while keeping all other
+    parameters fixed. Models how capacity fade from aging reduces TTE.
+
+    Returns list of (health_fraction, tte_hours) tuples.
+    """
+    if health_fractions is None:
+        health_fractions = [1.0, 0.9, 0.8, 0.7]
+
+    usage_fn = build_usage_schedule(session, display_df, params)
+    design_mah = 4329.0  # Original factory design capacity
+
+    results = []
+    for frac in health_fractions:
+        p = deepcopy(params)
+        p.Q_design_mah = design_mah * frac
+        print(f"    Simulating SOH={frac*100:.0f}% "
+              f"({p.Q_design_mah:.0f} mAh)...")
+        result = bm.simulate(
+            usage_fn, p,
+            cycle_count=cycle_count, dt=60.0,
+        )
+        results.append((frac, bm.time_to_empty_hours(result)))
+
+    return results
+
+
+def plot_soh_sweep(
+        sweep: List[Tuple[float, float]],
+        fig_path: Path,
+) -> None:
+    """Figure 10: TTE vs battery health bar chart."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    fracs = [s[0] for s in sweep]
+    ttes = [s[1] for s in sweep]
+    labels = [f"{f*100:.0f}%" for f in fracs]
+
+    # Color gradient: green (healthy) to red (degraded)
+    colors = plt.cm.RdYlGn(np.linspace(0.8, 0.2, len(fracs)))
+
+    bars = ax.bar(labels, ttes, color=colors, edgecolor="white", width=0.5)
+
+    # Annotate with TTE and capacity in mAh
+    for bar, tte, frac in zip(bars, ttes, fracs):
+        mah = 4329.0 * frac
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                f"{tte:.1f}h\n({mah:.0f} mAh)",
+                ha="center", va="bottom", fontsize=9)
+
+    ax.set_xlabel("Battery Health (% of design capacity)")
+    ax.set_ylabel("Time to Empty (hours)")
+    ax.set_title("Battery Life vs State of Health")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+def run_scenario_comparison(
+        params: bm.BatteryParams,
+        cycle_count: int = 716,
+) -> List[Tuple[str, float, float]]:
+    """TTE for each predefined usage scenario.
+
+    Uses constant-usage simulation for well-defined scenarios (idle, browsing,
+    streaming, gaming, etc.) plus a daily mixed-use pattern.
+
+    Returns list of (scenario_name, power_mw, tte_hours) sorted by TTE desc.
+    """
+    results = []
+    for name, usage_state in bm.SCENARIOS.items():
+        print(f"    Simulating {name}...")
+        usage_fn = bm.make_constant_usage(usage_state)
+        result = bm.simulate(
+            usage_fn, params,
+            cycle_count=cycle_count, dt=60.0,
+        )
+        pw = bm.total_power(usage_state, params)
+        tte = bm.time_to_empty_hours(result)
+        results.append((name, pw, tte))
+
+    # Add daily mixed-use pattern (40% active screen time)
+    print("    Simulating daily_mixed...")
+    daily_fn = bm.make_daily_usage(active_fraction=0.4, brightness=0.5)
+    result = bm.simulate(daily_fn, params, cycle_count=cycle_count, dt=60.0)
+    tte = bm.time_to_empty_hours(result)
+    avg_pw = float(np.mean(result["power_mw"]))
+    results.append(("daily_mixed", avg_pw, tte))
+
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results
+
+
+def plot_scenario_comparison(
+        scenarios: List[Tuple[str, float, float]],
+        fig_path: Path,
+) -> None:
+    """Figure 11: Horizontal bar chart of scenario TTEs.
+
+    Filters out extreme idle scenarios (TTE > 48h) for readability,
+    annotating them as text instead.
+    """
+    # Split into displayable and extreme-idle
+    active = [(n, pw, tte) for n, pw, tte in scenarios if tte <= 48]
+    extreme = [(n, pw, tte) for n, pw, tte in scenarios if tte > 48]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    names = [s[0].replace("_", " ").title() for s in active]
+    powers = np.array([s[1] for s in active])
+    ttes = [s[2] for s in active]
+
+    # Color by power draw: low power = green, high = red
+    norm = plt.Normalize(powers.min(), powers.max())
+    colors = plt.cm.RdYlGn_r(norm(powers))
+
+    bars = ax.barh(names, ttes, color=colors, edgecolor="white", height=0.6)
+
+    # Annotate with TTE and average power
+    for bar, tte, pw in zip(bars, ttes, powers):
+        label = f"{tte:.1f}h ({pw:.0f} mW)"
+        ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
+                label, va="center", fontsize=9)
+
+    ax.set_xlabel("Time to Empty (hours)")
+    ax.set_title("Battery Life by Usage Scenario")
+    ax.invert_yaxis()
+    ax.grid(True, alpha=0.3, axis="x")
+
+    # Note extreme idle scenarios as text annotation
+    if extreme:
+        lines = [f"{n.replace('_', ' ').title()}: {tte:.0f}h ({pw:.0f} mW)"
+                 for n, pw, tte in extreme]
+        note = "Standby: " + ", ".join(lines)
+        ax.text(0.98, 0.02, note, transform=ax.transAxes, fontsize=8,
+                ha="right", va="bottom", style="italic", color="gray")
+
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+def run_screen_fraction_sweep(
+        params: bm.BatteryParams,
+        cycle_count: int = 716,
+        fractions: Optional[List[float]] = None,
+) -> List[Tuple[float, float]]:
+    """TTE vs screen-on time fraction using daily usage pattern.
+
+    Screen time is the dominant user-controllable factor in daily battery
+    life. Uses make_daily_usage() with 7am-11pm wake cycle and varying
+    active_fraction (fraction of wake hours with screen on).
+
+    Returns list of (screen_on_fraction, tte_hours) tuples.
+    """
+    if fractions is None:
+        fractions = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+    results = []
+    for frac in fractions:
+        usage_fn = bm.make_daily_usage(active_fraction=frac, brightness=0.5)
+        result = bm.simulate(
+            usage_fn, params,
+            cycle_count=cycle_count, dt=60.0,
+        )
+        results.append((frac, bm.time_to_empty_hours(result)))
+
+    return results
+
+
+def plot_screen_fraction_sweep(
+        sweep: List[Tuple[float, float]],
+        fig_path: Path,
+) -> None:
+    """Figure 12: TTE vs screen-on fraction line plot."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    fracs = [s[0] * 100 for s in sweep]  # convert to percentage
+    ttes = [s[1] for s in sweep]
+
+    ax.plot(fracs, ttes, "o-", color="steelblue", linewidth=2, markersize=6)
+
+    # Shade typical range (30-60% screen time)
+    ax.axvspan(30, 60, alpha=0.1, color="steelblue",
+               label="Typical range (30-60%)")
+
+    # Annotate first, middle, and last points
+    for i in [0, len(fracs) // 2, -1]:
+        ax.annotate(f"{ttes[i]:.1f}h",
+                    (fracs[i], ttes[i]),
+                    textcoords="offset points", xytext=(10, 5),
+                    fontsize=9)
+
+    ax.set_xlabel("Screen-On Time (% of wake hours)")
+    ax.set_ylabel("Time to Empty (hours)")
+    ax.set_title("Battery Life vs Screen Usage")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(-2, 102)
+
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fig_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Multi-session validation (EPSQL -- 38 days, 5-min resolution)
 #
 # Two independent validation modes, each testing different model components:
@@ -1369,6 +1677,41 @@ def run_pipeline(db_path: Path, figures_dir: Path,
         print(f"  {name:30s}  [{lo:.1f}, {hi:.1f}]  "
               f"swing={abs(hi-lo):.1f} h")
     plot_tornado(tornado, figures_dir / "sysdiag_tornado.png")
+
+    # --- Temperature sweep (Figure 9) ---
+    print("\n--- Temperature Sweep ---")
+    temp_sweep = run_temperature_sweep(
+        session, display_df, params, cycle_count)
+    for T, tte in temp_sweep:
+        print(f"  T={T:+6.1f}C  ->  TTE = {tte:.1f} h")
+    plot_temperature_sweep(
+        temp_sweep, figures_dir / "sysdiag_temperature_sweep.png")
+
+    # --- Battery health sweep (Figure 10) ---
+    print("\n--- Battery Health (SOH) Sweep ---")
+    soh_sweep = run_soh_sweep(
+        session, display_df, params, cycle_count)
+    for frac, tte in soh_sweep:
+        print(f"  SOH={frac*100:.0f}% ({4329*frac:.0f} mAh)  "
+              f"->  TTE = {tte:.1f} h")
+    plot_soh_sweep(
+        soh_sweep, figures_dir / "sysdiag_soh_sweep.png")
+
+    # --- Usage scenario comparison (Figure 11) ---
+    print("\n--- Usage Scenario Comparison ---")
+    scenarios = run_scenario_comparison(params, cycle_count)
+    for name, pw, tte in scenarios:
+        print(f"  {name:25s}  {pw:6.0f} mW  ->  {tte:.1f} h")
+    plot_scenario_comparison(
+        scenarios, figures_dir / "sysdiag_scenario_comparison.png")
+
+    # --- Screen-on fraction sweep (Figure 12) ---
+    print("\n--- Screen-On Fraction Sweep ---")
+    screen_sweep = run_screen_fraction_sweep(params, cycle_count)
+    for frac, tte in screen_sweep:
+        print(f"  Screen {frac*100:5.0f}%  ->  TTE = {tte:.1f} h")
+    plot_screen_fraction_sweep(
+        screen_sweep, figures_dir / "sysdiag_screen_fraction.png")
 
     # --- EPSQL multi-session validation (Figures 7-8) ---
     #
