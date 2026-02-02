@@ -7,8 +7,8 @@ Problem A paper.
 
 **License:** CC BY 4.0 (see `LICENSE`).
 
-**Device:** iPhone 16 Pro Max, iOS 18.3, 716 charge cycles, 86% state of
-health (Q_ref = 3727 mAh, Q_design = 4329 mAh).
+**Device:** iPhone 13 Pro Max (D64, A15 Bionic), 718 charge cycles, 86%
+state of health (Q_ref = 3727 mAh, Q_design = 4325 mAh).
 
 **Collection date:** 2026-02-01.
 
@@ -87,7 +87,7 @@ measurements.
 ### Resistance Table (`parameters/ra_table.csv`)
 
 15-point SOC-dependent internal resistance R0(z), read from the iOS
-`RaTable` diagnostic field (716 cycles, 86% health). Values are in ohms.
+`RaTable` diagnostic field (718 cycles, 86% health). Values are in ohms.
 
 ### Calibrated Parameters (`parameters/calibrated_params.json`)
 
@@ -119,13 +119,14 @@ content, or contact information is included.
 
 ## Citation
 
-If you use this dataset, please cite our MCM 2026 paper and this repository:
+If you use this dataset, please cite this repository:
 
 ```
 @misc{miller2026battery,
   author = {Miller, Mark},
   title  = {{iPhone Battery Telemetry Dataset for ECC Model Validation}},
   year   = {2026},
-  url    = {https://github.com/markm39/mcm-battery-2026}
+  url    = {https://github.com/markm39/mcm-battery-2026},
+  note   = {Companion dataset for MCM 2026 Problem A submission (paper citation TBD)}
 }
 ```
