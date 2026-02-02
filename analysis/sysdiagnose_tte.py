@@ -42,6 +42,52 @@ import battery_model as bm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Plot style
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Palette (defined before _setup_style so rcParams can reference them)
+C_BLUE = "#4C72B0"
+C_ORANGE = "#DD8452"
+C_GREEN = "#55A868"
+C_RED = "#C44E52"
+C_PURPLE = "#8172B3"
+C_TEAL = "#17A589"
+C_DARK = "#2D3436"
+C_GRAY = "#636E72"
+
+
+def _setup_style():
+    """Configure publication-quality matplotlib styling."""
+    try:
+        import scienceplots  # noqa: F401
+        plt.style.use(["science", "no-latex"])
+    except ImportError:
+        pass
+    plt.rcParams.update({
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 11,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 10,
+        "legend.frameon": True,
+        "legend.framealpha": 0.9,
+        "legend.edgecolor": "#cccccc",
+        "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "lines.linewidth": 1.8,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.15,
+    })
+
+
+_setup_style()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -377,10 +423,11 @@ def plot_component_energy(breakdown_df: pd.DataFrame, fig_path: Path) -> None:
     total = energy.sum()
     pct = energy / total * 100
 
-    colors = plt.cm.Set2(np.linspace(0, 1, len(components)))
-    bars = ax.barh(components, pct, color=colors)
+    colors = plt.cm.Blues(np.linspace(0.35, 0.85, len(components)))
+    bars = ax.barh(components, pct, color=colors, height=0.65,
+                   edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Energy Share (%)")
-    ax.set_title("Component Energy Breakdown (Sysdiagnose)")
+    ax.set_title("Component Energy Breakdown")
     ax.invert_yaxis()
 
     for bar, p in zip(bars, pct):
@@ -388,7 +435,7 @@ def plot_component_energy(breakdown_df: pd.DataFrame, fig_path: Path) -> None:
                 f"{p:.1f}%", va="center", fontsize=9)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -432,10 +479,11 @@ def plot_app_categories(cat_df: pd.DataFrame, fig_path: Path) -> None:
     total = energy.sum()
     pct = energy / total * 100
 
-    colors = plt.cm.tab10(np.linspace(0, 1, len(categories)))
-    bars = ax.barh(categories, pct, color=colors)
+    colors = plt.cm.Greens(np.linspace(0.35, 0.85, len(categories)))
+    bars = ax.barh(categories, pct, color=colors, height=0.65,
+                   edgecolor="white", linewidth=0.5)
     ax.set_xlabel("Energy Share (%)")
-    ax.set_title("App Category Energy (Sysdiagnose)")
+    ax.set_title("App Category Energy Breakdown")
     ax.invert_yaxis()
 
     for bar, p in zip(bars, pct):
@@ -444,7 +492,7 @@ def plot_app_categories(cat_df: pd.DataFrame, fig_path: Path) -> None:
                     f"{p:.1f}%", va="center", fontsize=9)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -625,20 +673,20 @@ def plot_soc_comparison(fwd: Dict, fig_path: Path) -> None:
     t_obs_h = fwd["obs_t"] / 3600.0
     t_mod_h = fwd["model"]["t"] / 3600.0
 
-    ax.plot(t_obs_h, fwd["obs_soc"] * 100, "k-", linewidth=2,
-            label="Observed (iOS)")
-    ax.plot(t_mod_h, fwd["model"]["soc"] * 100, "r--", linewidth=1.5,
-            label="Model")
+    ax.plot(t_obs_h, fwd["obs_soc"] * 100, color=C_DARK, linewidth=2,
+            label="Observed (iOS)", zorder=3)
+    ax.plot(t_mod_h, fwd["model"]["soc"] * 100, color=C_BLUE, linewidth=1.8,
+            linestyle="--", label="Model", zorder=4)
 
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("SOC (%)")
-    ax.set_title("Model vs Observed SOC (Sysdiagnose)")
+    ax.set_title("Forward Simulation: Model vs Observed SOC")
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.15)
     ax.set_ylim(0, 105)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -654,18 +702,19 @@ def plot_voltage_comparison(fwd: Dict, fig_path: Path) -> None:
     t_obs_h = fwd["obs_t"] / 3600.0
     t_mod_h = fwd["model"]["t"] / 3600.0
 
-    ax.plot(t_obs_h, fwd["obs_voltage"], "k-", linewidth=2, label="Observed")
-    ax.plot(t_mod_h, fwd["model"]["voltage"], "r--", linewidth=1.5,
-            label="Model")
+    ax.plot(t_obs_h, fwd["obs_voltage"], color=C_DARK, linewidth=2,
+            label="Observed", zorder=3)
+    ax.plot(t_mod_h, fwd["model"]["voltage"], color=C_BLUE, linewidth=1.8,
+            linestyle="--", label="Model", zorder=4)
 
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("Voltage (V)")
-    ax.set_title("Model vs Observed Terminal Voltage (Sysdiagnose)")
+    ax.set_title("Model vs Observed Terminal Voltage")
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.15)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -765,26 +814,27 @@ def plot_mc_histogram(mc: Dict, fig_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
 
     ttes = mc["tte_hours"]
-    ax.hist(ttes, bins=30, color="steelblue", alpha=0.8, edgecolor="white")
+    ax.hist(ttes, bins=30, color=C_BLUE, alpha=0.75, edgecolor="white",
+            linewidth=0.5)
 
-    ax.axvline(mc["median"], color="red", linestyle="-", linewidth=2,
+    ax.axvline(mc["median"], color=C_RED, linestyle="-", linewidth=2,
                label=f"Median: {mc['median']:.1f} h")
-    ax.axvline(mc["ci_95_lo"], color="orange", linestyle="--", linewidth=1.5,
+    ax.axvline(mc["ci_95_lo"], color=C_ORANGE, linestyle="--", linewidth=1.5,
                label=f"95% CI: [{mc['ci_95_lo']:.1f}, {mc['ci_95_hi']:.1f}] h")
-    ax.axvline(mc["ci_95_hi"], color="orange", linestyle="--", linewidth=1.5)
+    ax.axvline(mc["ci_95_hi"], color=C_ORANGE, linestyle="--", linewidth=1.5)
 
     if "obs_tte_h" in mc:
-        ax.axvline(mc["obs_tte_h"], color="black", linestyle=":", linewidth=2,
+        ax.axvline(mc["obs_tte_h"], color=C_DARK, linestyle=":", linewidth=2,
                    label=f"Observed: {mc['obs_tte_h']:.1f} h")
 
     ax.set_xlabel("Time to Empty (hours)")
     ax.set_ylabel("Count")
-    ax.set_title(f"Monte Carlo TTE (N={len(ttes)})")
+    ax.set_title(f"Monte Carlo TTE Distribution (N={len(ttes)})")
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.15)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -882,9 +932,9 @@ def plot_multi_temp_tornado(
             delta_hi = hi - nom
             left = min(delta_lo, delta_hi)
             width = abs(delta_hi - delta_lo)
-            color = "steelblue" if delta_hi > delta_lo else "coral"
+            color = C_BLUE if delta_hi > delta_lo else C_RED
             ax.barh(y_pos[idx], width, left=left + nom, height=0.6,
-                    color=color, alpha=0.8)
+                    color=color, alpha=0.85)
 
             # Annotate swing if non-negligible
             swing = abs(hi - lo)
@@ -892,7 +942,7 @@ def plot_multi_temp_tornado(
                 ax.text(max(lo, hi) + 0.05, y_pos[idx],
                         f"{swing:.1f}h", va="center", fontsize=8)
 
-        ax.axvline(tte_nom, color="black", linestyle="-", linewidth=1)
+        ax.axvline(tte_nom, color=C_DARK, linestyle="-", linewidth=1)
         ax.set_yticks(y_pos)
         ax.set_yticklabels(names, fontsize=10)
         ax.set_xlabel("TTE (hours)")
@@ -900,12 +950,12 @@ def plot_multi_temp_tornado(
         ax.set_title(f"$T_{{amb}} = {T_label}\\,^\\circ$C"
                      f"  (nom: {tte_nom:.1f} h)")
         ax.invert_yaxis()
-        ax.grid(True, alpha=0.3, axis="x")
+        ax.grid(True, alpha=0.15, axis="x")
 
     fig.suptitle("Parameter Sensitivity vs. Ambient Temperature",
                  fontsize=13, y=1.02)
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    fig.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -991,10 +1041,10 @@ def plot_temperature_sweep(
     ax.set_xlabel("Ambient Temperature (C)")
     ax.set_ylabel("Time to Empty (hours)")
     ax.set_title("Battery Life vs Ambient Temperature")
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.grid(True, alpha=0.15, axis="y")
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1060,10 +1110,10 @@ def plot_soh_sweep(
     ax.set_xlabel("Battery Health (% of design capacity)")
     ax.set_ylabel("Time to Empty (hours)")
     ax.set_title("Battery Life vs State of Health")
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.grid(True, alpha=0.15, axis="y")
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1137,7 +1187,7 @@ def plot_scenario_comparison(
     ax.set_xlabel("Time to Empty (hours)")
     ax.set_title("Battery Life by Usage Scenario")
     ax.invert_yaxis()
-    ax.grid(True, alpha=0.3, axis="x")
+    ax.grid(True, alpha=0.15, axis="x")
 
     # Note extreme idle scenarios as text annotation
     if extreme:
@@ -1145,10 +1195,10 @@ def plot_scenario_comparison(
                  for n, pw, tte in extreme]
         note = "Standby: " + ", ".join(lines)
         ax.text(0.98, 0.02, note, transform=ax.transAxes, fontsize=8,
-                ha="right", va="bottom", style="italic", color="gray")
+                ha="right", va="bottom", style="italic", color=C_GRAY)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1191,10 +1241,10 @@ def plot_screen_fraction_sweep(
     fracs = [s[0] * 100 for s in sweep]  # convert to percentage
     ttes = [s[1] for s in sweep]
 
-    ax.plot(fracs, ttes, "o-", color="steelblue", linewidth=2, markersize=6)
+    ax.plot(fracs, ttes, "o-", color=C_BLUE, linewidth=2, markersize=6)
 
     # Shade typical range (30-60% screen time)
-    ax.axvspan(30, 60, alpha=0.1, color="steelblue",
+    ax.axvspan(30, 60, alpha=0.08, color=C_BLUE,
                label="Typical range (30-60%)")
 
     # Annotate first, middle, and last points
@@ -1208,11 +1258,11 @@ def plot_screen_fraction_sweep(
     ax.set_ylabel("Time to Empty (hours)")
     ax.set_title("Battery Life vs Screen Usage")
     ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.15)
     ax.set_xlim(-2, 102)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1493,12 +1543,13 @@ def plot_multi_session_scatter(
     mask = np.isfinite(obs) & np.isfinite(model) & (obs < 50) & (model < 50)
     obs, model = obs[mask], model[mask]
 
-    ax.scatter(obs, model, c="steelblue", alpha=0.7, s=40,
+    ax.scatter(obs, model, c=C_BLUE, alpha=0.7, s=40,
                edgecolors="white", linewidth=0.5)
 
     # Identity line and +/-20% band
     lim = max(obs.max(), model.max()) * 1.1 if len(obs) > 0 else 30
-    ax.plot([0, lim], [0, lim], "k--", alpha=0.5, label="Perfect prediction")
+    ax.plot([0, lim], [0, lim], "--", color=C_DARK, alpha=0.5,
+            label="Perfect prediction")
     x_line = np.linspace(0, lim, 100)
     ax.fill_between(x_line, x_line * 0.8, x_line * 1.2,
                     alpha=0.1, color="gray", label="+/- 20%")
@@ -1527,10 +1578,10 @@ def plot_multi_session_scatter(
     ax.set_xlim(0, lim)
     ax.set_ylim(0, lim)
     ax.set_aspect("equal")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.15)
 
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1551,28 +1602,28 @@ def plot_multi_session_errors(
     # Left: Current-driven SOC RMSE (tests capacity + OCV)
     cd_rmse = results_df["cd_rmse_pct"].dropna().values
     if len(cd_rmse) > 0:
-        ax1.hist(cd_rmse, bins=15, color="steelblue", alpha=0.8,
+        ax1.hist(cd_rmse, bins=15, color=C_BLUE, alpha=0.8,
                  edgecolor="white")
-        ax1.axvline(np.median(cd_rmse), color="red", linestyle="--",
+        ax1.axvline(np.median(cd_rmse), color=C_RED, linestyle="--",
                     label=f"Median: {np.median(cd_rmse):.1f}%")
         ax1.legend()
     ax1.set_xlabel("SOC RMSE (% points)")
     ax1.set_ylabel("Count")
     ax1.set_title("Current-Driven\n(tests Q_eff, OCV)")
-    ax1.grid(True, alpha=0.3)
+    ax1.grid(True, alpha=0.15)
 
     # Center: Forward sim SOC RMSE (tests full pipeline)
     fwd_rmse = results_df["fwd_rmse_pct"].dropna().values
     if len(fwd_rmse) > 0:
-        ax2.hist(fwd_rmse, bins=15, color="teal", alpha=0.8,
+        ax2.hist(fwd_rmse, bins=15, color=C_TEAL, alpha=0.8,
                  edgecolor="white")
-        ax2.axvline(np.median(fwd_rmse), color="red", linestyle="--",
+        ax2.axvline(np.median(fwd_rmse), color=C_RED, linestyle="--",
                     label=f"Median: {np.median(fwd_rmse):.1f}%")
         ax2.legend()
     ax2.set_xlabel("SOC RMSE (% points)")
     ax2.set_ylabel("Count")
     ax2.set_title("Forward Sim\n(tests power pipeline)")
-    ax2.grid(True, alpha=0.3)
+    ax2.grid(True, alpha=0.15)
 
     # Right: TTE error histogram
     mask = (np.isfinite(results_df["obs_tte_h"]) &
@@ -1582,21 +1633,21 @@ def plot_multi_session_errors(
     tte_err = tte_err[np.abs(tte_err) < 20]
 
     if len(tte_err) > 0:
-        ax3.hist(tte_err, bins=15, color="coral", alpha=0.8,
+        ax3.hist(tte_err, bins=15, color=C_ORANGE, alpha=0.8,
                  edgecolor="white")
-        ax3.axvline(0, color="black", linestyle="-", linewidth=1)
-        ax3.axvline(np.median(tte_err), color="red", linestyle="--",
+        ax3.axvline(0, color=C_DARK, linestyle="-", linewidth=1)
+        ax3.axvline(np.median(tte_err), color=C_RED, linestyle="--",
                     label=f"Median: {np.median(tte_err):+.1f} h")
         ax3.legend()
     ax3.set_xlabel("TTE Error (model - obs, hours)")
     ax3.set_ylabel("Count")
     ax3.set_title("TTE Prediction Error\n(practical accuracy)")
-    ax3.grid(True, alpha=0.3)
+    ax3.grid(True, alpha=0.15)
 
     fig.suptitle(f"Multi-Session Validation (N={len(results_df)} sessions)",
                  fontsize=13, y=1.02)
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
+    fig.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
