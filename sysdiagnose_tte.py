@@ -34,9 +34,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Add script directory for battery_model import (flat repo layout)
-_SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(_SCRIPT_DIR))
+# Add project root for battery_model import
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 import battery_model as bm
 
 
@@ -44,8 +44,8 @@ import battery_model as bm
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_DB = _SCRIPT_DIR / "data" / "CurrentPowerlog.PLSQL"
-DEFAULT_FIGURES = _SCRIPT_DIR / "figures"
+DEFAULT_DB = _PROJECT_ROOT / "data" / "raw" / "sysdiagnose" / "CurrentPowerlog.PLSQL"
+DEFAULT_FIGURES = _PROJECT_ROOT / "figures"
 
 # iOS hardware root-node name -> model component mapping
 # These are the permanent hardware nodes in PLAccountingOperator_EventNone_Nodes
@@ -454,17 +454,25 @@ def plot_app_categories(cat_df: pd.DataFrame, fig_path: Path) -> None:
 
 def build_usage_schedule(
         session: pd.DataFrame,
-        display_df: Optional[pd.DataFrame] = None
+        display_df: Optional[pd.DataFrame] = None,
+        params: Optional[bm.BatteryParams] = None,
 ) -> bm.Callable[[float], Dict]:
     """Build a piecewise-constant usage schedule from sysdiagnose events.
 
-    Screen brightness comes from display events (normalized to 0-1).
-    CPU load is inferred from discharge current magnitude.
+    Power calibration: cpu_load is set so model total_power matches
+    measured V*|I| at each interval. This keeps the model's equation
+    pipeline intact while feeding it realistic power.
+
+    Screen state:
+      - If display_df provided: real brightness from PLDisplayAgent
+      - Otherwise: inferred from |I| > 80mA heuristic
     """
+    if params is None:
+        params = bm.DEFAULT
     t0 = session["timestamp"].iloc[0]
     session_seconds = (session["timestamp"] - t0).dt.total_seconds().values
 
-    # Build brightness timeline from display events
+    # --- Screen state ---
     brightness_times: np.ndarray = np.array([])
     brightness_vals: np.ndarray = np.array([])
     screen_on_flags: np.ndarray = np.array([])
@@ -479,38 +487,69 @@ def build_usage_schedule(
             brightness_vals = disp_session["brightness_01"].values.astype(float)
             screen_on_flags = disp_session["screen_on"].values.astype(float)
 
-    # Estimate CPU load from current magnitude
-    if "InstantAmperage" in session.columns:
-        current_ma = np.abs(
-            pd.to_numeric(session["InstantAmperage"], errors="coerce")
-            .fillna(0).values)
-        # Normalize: 0mA -> 0, 2000mA -> 1.0
-        cpu_loads = np.clip(current_ma / 2000.0, 0.0, 1.0)
-    else:
-        cpu_loads = np.full(len(session_seconds), 0.15)
+    has_display = len(brightness_times) > 0
+
+    # --- Power-calibrated CPU load ---
+    # Compute measured battery power from V*|I| per interval
+    voltage_v = pd.to_numeric(
+        session["Voltage"], errors="coerce").fillna(3800).values / 1000.0
+    current_ma = pd.to_numeric(
+        session["InstantAmperage"], errors="coerce").fillna(0).values
+    abs_current = np.abs(current_ma)
+    measured_mw = voltage_v * abs_current
+
+    # For each interval, solve for cpu_load that reproduces measured power
+    n = len(session_seconds)
+    cpu_loads = np.zeros(n)
+
+    # Pre-compute screen state per battery interval for power calibration
+    per_interval_screen_on = np.zeros(n, dtype=bool)
+    per_interval_brightness = np.full(n, 0.5)
+
+    for k in range(n):
+        if has_display:
+            didx = np.searchsorted(brightness_times,
+                                   session_seconds[k], side="right") - 1
+            didx = max(0, min(didx, len(brightness_vals) - 1))
+            per_interval_brightness[k] = brightness_vals[didx]
+            per_interval_screen_on[k] = (
+                bool(screen_on_flags[didx]) if len(screen_on_flags) > 0
+                else brightness_vals[didx] > 0.01)
+        else:
+            # Heuristic: >80mA suggests screen on
+            per_interval_screen_on[k] = abs_current[k] > 80.0
+            per_interval_brightness[k] = 0.5 if per_interval_screen_on[k] else 0.0
+
+        son = per_interval_screen_on[k]
+        br = per_interval_brightness[k]
+
+        # Base power (everything except cpu_load contribution)
+        p_base = 0.0
+        if son:
+            p_base += params.screen_base_mw + params.screen_brightness_coeff_mw * br
+            p_base += params.overhead_screen_on_mw
+        else:
+            p_base += params.overhead_screen_off_mw
+        p_base += params.wifi_idle_mw
+        p_base += params.cellular_idle_mw
+        p_base += params.bt_idle_mw
+
+        if measured_mw[k] < params.cpu_idle_mw + 10:
+            cpu_loads[k] = 0.0
+        else:
+            load = (measured_mw[k] - p_base) / params.cpu_load_coeff_mw
+            cpu_loads[k] = float(max(load, 0.0))
 
     def schedule(t: float) -> Dict:
-        # Screen state
-        if len(brightness_times) > 0:
-            idx = np.searchsorted(brightness_times, t, side="right") - 1
-            idx = max(0, min(idx, len(brightness_vals) - 1))
-            br = float(brightness_vals[idx])
-            son = bool(screen_on_flags[idx]) if len(screen_on_flags) > 0 else br > 0.01
-        else:
-            br = 0.5
-            son = True
-
-        # CPU load from current interpolation
         batt_idx = np.searchsorted(session_seconds, t, side="right") - 1
-        batt_idx = max(0, min(batt_idx, len(cpu_loads) - 1))
-        cpu = float(cpu_loads[batt_idx])
+        batt_idx = max(0, min(batt_idx, n - 1))
 
         return {
-            "screen_on": son,
-            "brightness": br,
-            "cpu_load": cpu,
-            "wifi_state": "active",
-            "wifi_data_rate": 0.1,
+            "screen_on": bool(per_interval_screen_on[batt_idx]),
+            "brightness": float(per_interval_brightness[batt_idx]),
+            "cpu_load": float(cpu_loads[batt_idx]),
+            "wifi_state": "idle",
+            "wifi_data_rate": 0.0,
             "cellular_state": "idle",
             "cellular_signal": 0.8,
             "cellular_data_rate": 0.0,
@@ -558,7 +597,7 @@ def forward_simulation(
             if T_init > 80:
                 T_init = T_init / 100.0
 
-    usage_fn = build_usage_schedule(session, display_df)
+    usage_fn = build_usage_schedule(session, display_df, params)
 
     result = bm.simulate(
         usage_fn, params,
@@ -703,7 +742,7 @@ def run_monte_carlo(
         n_samples: int = 500
 ) -> Dict:
     """Run Monte Carlo TTE with parameter perturbation."""
-    usage_fn = build_usage_schedule(session, display_df)
+    usage_fn = build_usage_schedule(session, display_df, params)
 
     print(f"  Running Monte Carlo TTE (N={n_samples})...")
     mc = bm.monte_carlo_tte(
@@ -756,7 +795,7 @@ def run_tornado(
         cycle_count: int = 716
 ) -> List[Tuple[str, float, float, float]]:
     """Compute tornado sensitivity data."""
-    usage_fn = build_usage_schedule(session, display_df)
+    usage_fn = build_usage_schedule(session, display_df, params)
 
     print("  Computing tornado sensitivity...")
     return bm.tornado_sensitivity(
@@ -858,6 +897,9 @@ def build_power_calibrated_schedule(
     screen_on = abs_current > 80.0
 
     # Calibrate cpu_load per interval so total_power ~= measured_mw
+    # Cap at 1.0 for EPSQL: InstantAmperage is a point-in-time snapshot,
+    # not an interval average, so current spikes overestimate 5-min power.
+    # The clip at 1.0 compensates for this upward bias.
     n = len(session)
     cpu_loads = np.zeros(n)
     brightness = np.where(screen_on, 0.5, 0.0)
@@ -868,13 +910,14 @@ def build_power_calibrated_schedule(
         p_base = 0.0
         if son:
             p_base += params.screen_base_mw + params.screen_brightness_coeff_mw * 0.5
-        p_base += params.cpu_background_mw
+            p_base += params.overhead_screen_on_mw
+        else:
+            p_base += params.overhead_screen_off_mw
         p_base += params.wifi_idle_mw
         p_base += params.cellular_idle_mw
         p_base += params.bt_idle_mw
 
         if measured_mw[k] < params.cpu_idle_mw + 10:
-            # Deep sleep: below idle threshold
             cpu_loads[k] = 0.0
         else:
             load = (measured_mw[k] - p_base) / params.cpu_load_coeff_mw
@@ -1008,7 +1051,7 @@ def validate_multi_session(
         if (plsql_t0 is not None and
                 t0 >= plsql_t0 and
                 session["timestamp"].iloc[-1] <= plsql_t1):
-            usage_fn = build_usage_schedule(session, display_df)
+            usage_fn = build_usage_schedule(session, display_df, params)
             used_display = True
         else:
             usage_fn = build_power_calibrated_schedule(session, params)

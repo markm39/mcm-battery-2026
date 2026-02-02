@@ -129,7 +129,12 @@ class BatteryParams:
     screen_brightness_coeff_mw: float = 400.0
     cpu_idle_mw: float = 5.0
     cpu_load_coeff_mw: float = 1500.0
-    cpu_background_mw: float = 760.0
+    # Two-state system overhead calibrated from PLSQL screen-on/off power:
+    #   Screen ON  median V*|I| = 506 mW - 250 (display) - 25 (radio) = 231 mW
+    #   Screen OFF median V*|I| = 263 mW - 25 (radio) = 238 mW
+    # Source: PLBatteryAgent + PLDisplayAgent cross-reference, 4939 discharge rows
+    overhead_screen_on_mw: float = 230.0
+    overhead_screen_off_mw: float = 240.0
     wifi_idle_mw: float = 10.0
     wifi_active_mw: float = 800.0
     wifi_scanning_mw: float = 300.0
@@ -262,9 +267,18 @@ def screen_power(brightness: float, screen_on: bool,
 
 def cpu_power(load: float, screen_on: bool,
               params: BatteryParams = DEFAULT) -> float:
+    """CPU + system overhead power.
+
+    Three regimes:
+      Deep sleep (screen off, load < 1%):  cpu_idle_mw (~5 mW)
+      Screen off, active:  overhead_screen_off_mw + load * cpu_load_coeff_mw
+      Screen on:           overhead_screen_on_mw  + load * cpu_load_coeff_mw
+    """
     if not screen_on and load < 0.01:
         return params.cpu_idle_mw
-    return params.cpu_background_mw + params.cpu_load_coeff_mw * load
+    overhead = (params.overhead_screen_on_mw if screen_on
+                else params.overhead_screen_off_mw)
+    return overhead + params.cpu_load_coeff_mw * load
 
 
 def wifi_power(state: str, data_rate: float = 0.0,
@@ -745,7 +759,8 @@ def time_to_empty_hours(result: Dict) -> float:
 MC_DEFAULT_SIGMA: Dict[str, float] = {
     "Q_design_mah": 0.05,              # +/-5% capacity
     "R0_ref": 0.20,                    # +/-20% resistance
-    "cpu_background_mw": 0.20,         # +/-20% system overhead
+    "overhead_screen_on_mw": 0.20,     # +/-20% screen-on overhead
+    "overhead_screen_off_mw": 0.20,    # +/-20% screen-off overhead
     "screen_brightness_coeff_mw": 0.20, # +/-20% display power
     "alpha_Q": 0.30,                   # +/-30% temp sensitivity
     "hA": 0.30,                        # +/-30% thermal dissipation
@@ -1016,6 +1031,8 @@ if __name__ == "__main__":
     for j, b in enumerate(p.rc_branches):
         print(f"  RC[{j}]: R={b.R_ref:.3f} Ohm, C={b.C:.0f} F, "
               f"tau={b.tau:.1f} s, alpha_R={b.alpha_R}")
+    print(f"Overhead: screen_on={p.overhead_screen_on_mw} mW, "
+          f"screen_off={p.overhead_screen_off_mw} mW")
     print(f"Thermal:  C_th={p.C_th}, hA={p.hA}, "
           f"alpha_R0={p.alpha_R0}, alpha_Q={p.alpha_Q}")
     print(f"Aging:    alpha_fade={p.alpha_fade} "
