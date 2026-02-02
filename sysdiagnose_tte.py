@@ -793,49 +793,119 @@ def run_tornado(
         session: pd.DataFrame,
         display_df: Optional[pd.DataFrame],
         params: bm.BatteryParams,
-        cycle_count: int = 716
+        cycle_count: int = 716,
+        T_ambient: Optional[float] = None,
 ) -> List[Tuple[str, float, float, float]]:
-    """Compute tornado sensitivity data."""
+    """Compute tornado sensitivity data at a given temperature."""
     usage_fn = build_usage_schedule(session, display_df, params)
 
-    print("  Computing tornado sensitivity...")
+    label = f"T={T_ambient}C" if T_ambient is not None else "default"
+    print(f"  Computing tornado sensitivity ({label})...")
     return bm.tornado_sensitivity(
-        usage_fn, params, cycle_count=cycle_count, dt=60.0)
+        usage_fn, params, cycle_count=cycle_count,
+        T_ambient=T_ambient, dt=60.0)
 
 
-def plot_tornado(
-        sensitivities: List[Tuple[str, float, float, float]],
-        fig_path: Path
+def run_multi_temp_tornado(
+        session: pd.DataFrame,
+        display_df: Optional[pd.DataFrame],
+        params: bm.BatteryParams,
+        cycle_count: int = 716,
+        temperatures: Optional[List[float]] = None,
+) -> Dict[float, List[Tuple[str, float, float, float]]]:
+    """Tornado sensitivity at multiple ambient temperatures.
+
+    At room temperature (25C), thermal parameters (alpha_Q, hA, R0_ref)
+    have zero effect because max(T_ref - T, 0) = 0. Running at cold
+    temperatures reveals the true sensitivity structure: capacity derating
+    and resistance increase become dominant factors.
+
+    Returns {temperature: [(param_name, tte_lo, tte_nom, tte_hi), ...]}.
+    """
+    if temperatures is None:
+        temperatures = [-10.0, 10.0, 25.0]
+
+    results = {}
+    for T in temperatures:
+        results[T] = run_tornado(
+            session, display_df, params, cycle_count, T_ambient=T)
+    return results
+
+
+def plot_multi_temp_tornado(
+        tornado_by_temp: Dict[float, List[Tuple[str, float, float, float]]],
+        fig_path: Path,
 ) -> None:
-    """Figure 6: Tornado chart of parameter sensitivities."""
-    fig, ax = plt.subplots(figsize=(10, 5))
+    """Figure 6: Multi-panel tornado chart at different temperatures.
 
-    names = [s[0] for s in sensitivities]
-    tte_nom = sensitivities[0][2]
-    lo_vals = np.array([s[1] for s in sensitivities])
-    hi_vals = np.array([s[3] for s in sensitivities])
+    Shows how the sensitivity hierarchy changes with ambient temperature.
+    At 25C only Q_design and overhead matter; at -10C the thermal
+    parameters (alpha_Q, R0_ref, hA) become significant.
+    """
+    temps = sorted(tornado_by_temp.keys())
+    n_panels = len(temps)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5),
+                             sharey=True)
+    if n_panels == 1:
+        axes = [axes]
 
-    y_pos = np.arange(len(names))
+    # Use consistent parameter order across panels (sorted by swing at
+    # the coldest temperature, where all params are active)
+    coldest = temps[0]
+    param_order = [s[0] for s in tornado_by_temp[coldest]]
 
-    for idx in range(len(names)):
-        lo = lo_vals[idx] - tte_nom
-        hi = hi_vals[idx] - tte_nom
-        left = min(lo, hi)
-        width = abs(hi - lo)
-        color = "steelblue" if hi > lo else "coral"
-        ax.barh(y_pos[idx], width, left=left + tte_nom, height=0.6,
-                color=color, alpha=0.8)
+    # Readable labels
+    label_map = {
+        "Q_design_mah": "$Q_{design}$",
+        "R0_ref": "$R_{0,ref}$",
+        "overhead_screen_on_mw": "$P_{oh,on}$",
+        "overhead_screen_off_mw": "$P_{oh,off}$",
+        "screen_brightness_coeff_mw": "$P_{screen}$",
+        "alpha_Q": r"$\alpha_Q$",
+        "hA": "$hA$",
+    }
 
-    ax.axvline(tte_nom, color="black", linestyle="-", linewidth=1)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(names, fontsize=9)
-    ax.set_xlabel("TTE (hours)")
-    ax.set_title(f"Tornado Sensitivity (Nominal: {tte_nom:.1f} h)")
-    ax.invert_yaxis()
-    ax.grid(True, alpha=0.3, axis="x")
+    for ax, T in zip(axes, temps):
+        sens = tornado_by_temp[T]
+        sens_dict = {s[0]: s for s in sens}
 
+        # Reorder to match coldest-temp ordering
+        ordered = [sens_dict[name] for name in param_order
+                   if name in sens_dict]
+
+        names = [label_map.get(s[0], s[0]) for s in ordered]
+        tte_nom = ordered[0][2]
+        y_pos = np.arange(len(names))
+
+        for idx, (name_raw, lo, nom, hi) in enumerate(ordered):
+            delta_lo = lo - nom
+            delta_hi = hi - nom
+            left = min(delta_lo, delta_hi)
+            width = abs(delta_hi - delta_lo)
+            color = "steelblue" if delta_hi > delta_lo else "coral"
+            ax.barh(y_pos[idx], width, left=left + nom, height=0.6,
+                    color=color, alpha=0.8)
+
+            # Annotate swing if non-negligible
+            swing = abs(hi - lo)
+            if swing > 0.05:
+                ax.text(max(lo, hi) + 0.05, y_pos[idx],
+                        f"{swing:.1f}h", va="center", fontsize=8)
+
+        ax.axvline(tte_nom, color="black", linestyle="-", linewidth=1)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=10)
+        ax.set_xlabel("TTE (hours)")
+        T_label = f"{T:+.0f}" if T != 25 else "25"
+        ax.set_title(f"$T_{{amb}} = {T_label}\\,^\\circ$C"
+                     f"  (nom: {tte_nom:.1f} h)")
+        ax.invert_yaxis()
+        ax.grid(True, alpha=0.3, axis="x")
+
+    fig.suptitle("Parameter Sensitivity vs. Ambient Temperature",
+                 fontsize=13, y=1.02)
     fig.tight_layout()
-    fig.savefig(fig_path, dpi=150)
+    fig.savefig(fig_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {fig_path}")
 
@@ -1670,13 +1740,20 @@ def run_pipeline(db_path: Path, figures_dir: Path,
 
     plot_mc_histogram(mc, figures_dir / "sysdiag_mc_tte.png")
 
-    # --- Tornado (Figure 6) ---
-    print("\n--- Tornado Sensitivity ---")
-    tornado = run_tornado(session, display_df, params, cycle_count)
-    for name, lo, nom, hi in tornado:
-        print(f"  {name:30s}  [{lo:.1f}, {hi:.1f}]  "
-              f"swing={abs(hi-lo):.1f} h")
-    plot_tornado(tornado, figures_dir / "sysdiag_tornado.png")
+    # --- Multi-temperature tornado (Figure 6) ---
+    print("\n--- Tornado Sensitivity (multi-temperature) ---")
+    tornado_temps = [-10.0, 10.0, 25.0]
+    tornado_by_temp = run_multi_temp_tornado(
+        session, display_df, params, cycle_count,
+        temperatures=tornado_temps)
+    for T in tornado_temps:
+        print(f"\n  T = {T:+.0f}C:")
+        for name, lo, nom, hi in tornado_by_temp[T]:
+            swing = abs(hi - lo)
+            print(f"    {name:30s}  [{lo:.1f}, {hi:.1f}]  "
+                  f"swing={swing:.1f} h")
+    plot_multi_temp_tornado(
+        tornado_by_temp, figures_dir / "sysdiag_tornado.png")
 
     # --- Temperature sweep (Figure 9) ---
     print("\n--- Temperature Sweep ---")
